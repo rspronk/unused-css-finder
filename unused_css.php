@@ -25,7 +25,7 @@ if (PHP_SAPI !== 'cli') {
  * Run with --help for every option.
  */
 
-const VERSION = '1.0.4';
+const VERSION = '1.1.1';
 
 // Classes that are normally added by JavaScript at runtime and so are always kept.
 // Disable with --no-default-safelist.
@@ -33,6 +33,14 @@ const DEFAULT_SAFE_CLASSES = [
     '~^(active|show|open|hidden|visible|disabled|selected|fade|collapse|collapsing)$~',
     '~^(is|has|js)-~',
 ];
+
+// File types read by --source unless --source-ext says otherwise (stylesheets are never read as source).
+const DEFAULT_SOURCE_EXT = ['html', 'htm', 'xhtml', 'php', 'phtml', 'inc', 'twig', 'tpl', 'js', 'mjs', 'jsx',
+                            'ts', 'tsx', 'vue', 'svelte', 'erb', 'ejs', 'hbs', 'handlebars', 'njk', 'liquid',
+                            'asp', 'aspx', 'cshtml', 'jsp', 'md'];
+
+// Folders that --source skips, wherever they appear. Disable with --no-default-source-excludes.
+const DEFAULT_SOURCE_SKIP_DIRS = ['node_modules', 'vendor', 'bower_components', '.git', '.svn', '.hg', '.idea', '.vscode'];
 
 foreach (['curl', 'dom', 'libxml', 'pcre'] as $ext) {
     if (!extension_loaded($ext)) {
@@ -70,6 +78,13 @@ final class Cfg
     public static $exclude = [];
     public static $safeClasses = [];
     public static $safeIds = [];
+    public static $crawl = true;               // false when only --source is given
+    public static $sourceDirs = [];
+    public static $sourceExts = [];
+    public static $sourceExclude = [];
+    public static $defaultSourceExcludes = true;
+    public static $localCss = false;
+    public static $includeUnlinkedCss = false;
     public static $ignoreParams = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term',
                                    'utm_content', 'gclid', 'fbclid', 'PHPSESSID', 'sessionid'];
     public static $skipExt = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'avif', 'svg', 'ico', 'pdf', 'zip',
@@ -94,9 +109,12 @@ Finds CSS classes and ids that are not used anywhere on a website.
 
 USAGE
   php unused_css.php <url> [options]
+  php unused_css.php --source=FOLDER [options]
 
 EXAMPLES
   php unused_css.php https://example.com/
+  php unused_css.php --source=/var/www/example
+  php unused_css.php https://example.com/ --source=/var/www/example
   php unused_css.php https://example.com/ --purge
   php unused_css.php https://example.com/ --safelist="btn-*" --safelist=modal --exclude=/blog/
   php unused_css.php --config=unused-css.json
@@ -124,11 +142,26 @@ OPTIONS
   --config=FILE         Read options from a JSON file (command line wins)
   --help, --version
 
+SOURCE FILES (for areas a crawler cannot reach, such as logins and members areas)
+  --source=DIR          Also read the source files in DIR for class and id names (repeatable).
+                        With no web address, the .css files in DIR are checked as well.
+  --source-ext=LIST     File types to read, comma separated
+                        (default: html,htm,php,phtml,twig,js,jsx,ts,tsx,vue,svelte and more)
+  --source-exclude=PAT  Skip source paths matching PAT, measured from DIR (repeatable)
+  --no-default-source-excludes
+                        Also read node_modules, vendor, .git and similar folders
+  --local-css           With a web address, also check the .css files found in --source folders
+  --include-unlinked-css
+                        Check every .css file in the --source folders. By default only the ones
+                        that a source file refers to (a <link>, an @import, a script) are checked.
+
 PATTERNS
   A plain value may use * as a wildcard:  btn-*   *-icon   modal
   Start a value with re: for a regular expression:  re:^col-(sm|md)-\d+$
   (use re:(?i)^promo for a case-insensitive match)
   --exclude patterns are matched against the full URL, anywhere in it.
+  --source-exclude patterns are matched against the path inside the source folder,
+  written with forward slashes and starting with /, for example  /tests/  or  .min.js
   --safelist patterns must match the whole class or id name.
 
 CONFIG FILE
@@ -144,10 +177,11 @@ TXT;
 function parseArgs(array $argv): array
 {
     $valueOpts = ['output', 'concurrency', 'delay', 'max-pages', 'timeout', 'exclude', 'safelist',
-                  'safelist-id', 'user-agent', 'config', 'url'];
+                  'safelist-id', 'user-agent', 'config', 'url', 'source', 'source-ext', 'source-exclude'];
     $flagOpts  = ['purge', 'keep-query', 'external-css', 'external-js', 'no-robots', 'insecure',
-                  'fresh', 'no-default-safelist', 'no-js-prefixes', 'help', 'version'];
-    $repeat    = ['exclude', 'safelist', 'safelist-id'];
+                  'fresh', 'no-default-safelist', 'no-js-prefixes', 'help', 'version', 'local-css',
+                  'no-default-source-excludes', 'include-unlinked-css'];
+    $repeat    = ['exclude', 'safelist', 'safelist-id', 'source', 'source-exclude'];
 
     $o = ['_' => []];
     $n = count($argv);
@@ -205,7 +239,7 @@ function mergeConfigFile(array $o, string $file): array
         if ($key === '_' || isset($o[$key])) {
             continue; // the command line wins
         }
-        if (in_array($key, ['exclude', 'safelist', 'safelist-id'], true)) {
+        if (in_array($key, ['exclude', 'safelist', 'safelist-id', 'source', 'source-exclude'], true)) {
             $o[$key] = (array) $value;
         } elseif ($value !== false && $value !== null) {
             $o[$key] = $value;
@@ -252,20 +286,63 @@ function patternToRegex(string $v, bool $anchored): string
 function configure(array $o): void
 {
     $url = (string) (isset($o['url']) ? $o['url'] : (isset($o['_'][0]) ? $o['_'][0] : ''));
-    if ($url === '') {
-        fail("Please give the address of the site to scan, e.g.  php unused_css.php https://example.com/");
+    $sources = listOpt($o, 'source');
+    if ($url === '' && !$sources) {
+        fail("Please give the address of the site to scan, e.g.  php unused_css.php https://example.com/\n"
+            . "Or the folder holding your website files:  php unused_css.php --source=/path/to/site");
     }
-    if (!preg_match('#^[a-z][a-z0-9+.\-]*://#i', $url)) {
-        $url = 'https://' . $url;
+    if ($url !== '' && !preg_match('#^[a-z][a-z0-9+.\-]*://#i', $url) && is_dir($url)
+        && preg_match('#[\\\\/]|^\.#', $url)) {
+        fail("\"$url\" is a folder. To check the files in a folder use  --source=\"$url\"  "
+            . "(add a web address as well if you also want to crawl a site).");
     }
-    $p = parse_url($url);
-    if (!$p || empty($p['host']) || !in_array(strtolower((string) $p['scheme']), ['http', 'https'], true)) {
-        fail("That doesn't look like a valid http(s) address: $url");
+    Cfg::$crawl = ($url !== '');
+    if (Cfg::$crawl) {
+        if (!preg_match('#^[a-z][a-z0-9+.\-]*://#i', $url)) {
+            $url = 'https://' . $url;
+        }
+        $p = parse_url($url);
+        if (!$p || empty($p['host']) || !in_array(strtolower((string) $p['scheme']), ['http', 'https'], true)) {
+            fail("That doesn't look like a valid http(s) address: $url");
+        }
+        Cfg::$startUrl = $url;
+        Cfg::$host     = strtolower($p['host']);
+        Cfg::$scheme   = strtolower($p['scheme']);
+        Cfg::$port     = isset($p['port']) ? ':' . $p['port'] : '';
     }
-    Cfg::$startUrl = $url;
-    Cfg::$host     = strtolower($p['host']);
-    Cfg::$scheme   = strtolower($p['scheme']);
-    Cfg::$port     = isset($p['port']) ? ':' . $p['port'] : '';
+
+    foreach ($sources as $dir) {
+        $real = is_dir($dir) ? realpath($dir) : false;
+        if ($real === false) {
+            fail("Source folder not found: $dir");
+        }
+        if (!in_array($real, Cfg::$sourceDirs, true)) {
+            Cfg::$sourceDirs[] = $real;
+        }
+    }
+    $exts = [];
+    if (isset($o['source-ext'])) {
+        foreach ((array) $o['source-ext'] as $chunk) {
+            foreach (explode(',', (string) $chunk) as $e) {
+                $e = strtolower(ltrim(trim($e), '.'));
+                if ($e !== '' && $e !== 'css') {
+                    $exts[$e] = true;
+                }
+            }
+        }
+        if (!$exts) {
+            fail('--source-ext needs at least one file type, for example --source-ext=php,html,js');
+        }
+        Cfg::$sourceExts = array_keys($exts);
+    } else {
+        Cfg::$sourceExts = DEFAULT_SOURCE_EXT;
+    }
+    foreach (listOpt($o, 'source-exclude') as $v) {
+        Cfg::$sourceExclude[] = patternToRegex($v, false);
+    }
+    Cfg::$defaultSourceExcludes = empty($o['no-default-source-excludes']);
+    Cfg::$localCss = !empty($o['local-css']) || !Cfg::$crawl;
+    Cfg::$includeUnlinkedCss = !empty($o['include-unlinked-css']);
 
     Cfg::$concurrency   = intOpt($o, 'concurrency', 4, 1, 20);
     Cfg::$delayMs       = intOpt($o, 'delay', 0, 0, 60000);
@@ -297,8 +374,9 @@ function configure(array $o): void
     if (isset($o['output'])) {
         Cfg::$outputDir = rtrim((string) $o['output'], '/\\');
     } else {
-        $cwd = getcwd();
-        Cfg::$outputDir = ($cwd === false ? '.' : $cwd) . '/unused-css-' . preg_replace('/[^a-z0-9.\-]+/', '_', Cfg::$host);
+        $cwd  = getcwd();
+        $label = Cfg::$crawl ? Cfg::$host : strtolower(basename(Cfg::$sourceDirs[0]));
+        Cfg::$outputDir = ($cwd === false ? '.' : $cwd) . '/unused-css-' . trim((string) preg_replace('/[^a-z0-9.\-]+/', '_', $label), '_');
     }
     Cfg::$stateFile = Cfg::$outputDir . '/crawl-state.dat';
 }
@@ -528,7 +606,8 @@ function loadRobotsDisallows(): array
 /** Adds every word-like token in $text (and the parts of "a:b" tokens) to $set. */
 function addTokens(array &$set, string $text): void
 {
-    if (!preg_match_all('/[A-Za-z0-9_\-:]+/', $text, $m)) {
+    // Bytes 0x80-0xFF are included so class names written in other alphabets stay in one piece.
+    if (!preg_match_all('/[A-Za-z0-9_\-:\x80-\xFF]+/', $text, $m)) {
         return;
     }
     foreach ($m[0] as $t) {
@@ -541,6 +620,108 @@ function addTokens(array &$set, string $text): void
             }
         }
     }
+}
+
+// ---------------------- Source files (--source) ----------------------
+
+/**
+ * Reads the files in the --source folders. Every word in a source file counts as "used", the same
+ * way words in scripts do for a crawl. Also lists the .css files found when they are to be analysed.
+ *
+ * @return array{files:int, skipped:int, css:array, refs:array}
+ */
+function scanSources(array &$tokens): array
+{
+    $out   = ['files' => 0, 'skipped' => 0, 'css' => [], 'refs' => []];
+    $exts  = array_flip(Cfg::$sourceExts);
+    $multi = count(Cfg::$sourceDirs) > 1;
+
+    foreach (Cfg::$sourceDirs as $root) {
+        $rootSlash = rtrim(str_replace('\\', '/', $root), '/');
+        $dirs = new RecursiveDirectoryIterator($root, FilesystemIterator::SKIP_DOTS | FilesystemIterator::CURRENT_AS_FILEINFO);
+        $filtered = new RecursiveCallbackFilterIterator($dirs, function ($cur) use ($rootSlash) {
+            if ($cur->isDir() && Cfg::$defaultSourceExcludes
+                && in_array(strtolower($cur->getFilename()), DEFAULT_SOURCE_SKIP_DIRS, true)) {
+                return false;
+            }
+            if (Cfg::$sourceExclude) {
+                $rel = '/' . ltrim(substr(str_replace('\\', '/', $cur->getPathname()), strlen($rootSlash)), '/');
+                foreach (Cfg::$sourceExclude as $re) {
+                    if (preg_match($re, $rel)) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        });
+        $walk = new RecursiveIteratorIterator($filtered, RecursiveIteratorIterator::LEAVES_ONLY,
+            RecursiveIteratorIterator::CATCH_GET_CHILD);
+
+        foreach ($walk as $f) {
+            if (!$f->isFile()) {
+                continue;
+            }
+            $ext = strtolower((string) pathinfo($f->getFilename(), PATHINFO_EXTENSION));
+            if ($ext === 'css' && Cfg::$localCss) {
+                $real = realpath($f->getPathname());
+                if ($real !== false) {
+                    $rel = ltrim(substr(str_replace('\\', '/', $f->getPathname()), strlen($rootSlash)), '/');
+                    $out['css'][$real] = ['label' => ($multi ? basename($root) . '/' : '') . $rel, 'rel' => $rel];
+                }
+                continue;
+            }
+            if (!isset($exts[$ext])) {
+                continue;
+            }
+            $size = $f->getSize();
+            if ($size === false || $size > 20 * 1024 * 1024) {
+                $out['skipped']++;
+                continue;
+            }
+            $text = @file_get_contents($f->getPathname());
+            if ($text === false || strpos(substr($text, 0, 8000), "\0") !== false) {
+                $out['skipped']++; // unreadable, or a binary file
+                continue;
+            }
+            addTokens($tokens, $text);
+            if (stripos($text, '.css') !== false) {
+                cssReferences($out['refs'], $text);
+            }
+            $out['files']++;
+        }
+    }
+    ksort($out['css']);
+    return $out;
+}
+
+/** Collects the names of stylesheets mentioned in $text: <link href>, @import, script loaders, enqueue calls. */
+function cssReferences(array &$refs, string $text): void
+{
+    if (!preg_match_all('~([^"\'()<>\s=,;]*\.css)(?=[?#"\'()\s>,;]|$)~i', $text, $m)) {
+        return;
+    }
+    foreach ($m[1] as $r) {
+        if (preg_match('~^([a-z][a-z0-9+.\-]*:|//)~i', $r)) {
+            continue; // a web address (CDN), not one of the local files
+        }
+        $r = strtolower(ltrim((string) preg_replace('~^(\.{1,2}/)+~', '', str_replace('\\', '/', $r)), '/'));
+        if (strlen($r) > 4) { // ignores a bare ".css" built from variables
+            $refs[$r] = true;
+        }
+    }
+}
+
+/** True when a stylesheet at $rel (inside a source folder) is the one a reference points to. */
+function cssIsLinked(string $rel, array $refs): bool
+{
+    $rel = strtolower(str_replace('\\', '/', $rel));
+    foreach ($refs as $r => $_) {
+        $r = (string) $r;
+        if ($r === $rel || substr($rel, -strlen($r) - 1) === '/' . $r || substr($r, -strlen($rel) - 1) === '/' . $rel) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // ---------------------- Crawler ----------------------
@@ -1191,7 +1372,9 @@ echo "Unused CSS Finder " . VERSION . "\n";
 if (!Cfg::$verifySsl) {
     echo "Warning: SSL certificate checks are turned off (--insecure).\n";
 }
-resolveStartUrl();
+if (Cfg::$crawl) {
+    resolveStartUrl();
+}
 
 if (!is_dir(Cfg::$outputDir) && !mkdir(Cfg::$outputDir, 0775, true)) {
     fail('Could not create the output folder: ' . Cfg::$outputDir);
@@ -1200,23 +1383,30 @@ if (Cfg::$fresh && is_file(Cfg::$stateFile)) {
     unlink(Cfg::$stateFile);
 }
 
-echo 'Scanning ' . Cfg::$scheme . '://' . Cfg::$host . Cfg::$port . "/ (up to "
-    . (Cfg::$maxPages > 0 ? Cfg::$maxPages : 'unlimited') . " pages, " . Cfg::$concurrency . " at a time)\n";
+if (Cfg::$crawl) {
+    echo 'Scanning ' . Cfg::$scheme . '://' . Cfg::$host . Cfg::$port . "/ (up to "
+        . (Cfg::$maxPages > 0 ? Cfg::$maxPages : 'unlimited') . " pages, " . Cfg::$concurrency . " at a time)\n";
 
-$crawler = new Crawler();
-$crawler->run();
-$data = $crawler->result();
+    $crawler = new Crawler();
+    $crawler->run();
+    $data = $crawler->result();
 
-if ($data['parsed'] === 0) {
-    fail('No HTML pages could be read, so there is nothing to compare the CSS against.');
+    if ($data['parsed'] === 0) {
+        fail('No HTML pages could be read, so there is nothing to compare the CSS against.');
+    }
+
+    echo "\nCrawl finished: {$data['parsed']} pages read, " . count($data['classes']) . " classes, "
+        . count($data['ids']) . " ids, " . count($data['cssUrls']) . " stylesheets, "
+        . count($data['inlineCss']) . " inline <style> blocks, " . count($data['jsUrls']) . " scripts.\n";
+} else {
+    $data = ['pages' => 0, 'parsed' => 0, 'failed' => 0, 'failures' => [], 'truncated' => false,
+             'classes' => [], 'ids' => [], 'tokens' => [], 'cssUrls' => [], 'jsUrls' => [], 'inlineCss' => []];
 }
 
-echo "\nCrawl finished: {$data['parsed']} pages read, " . count($data['classes']) . " classes, "
-    . count($data['ids']) . " ids, " . count($data['cssUrls']) . " stylesheets, "
-    . count($data['inlineCss']) . " inline <style> blocks, " . count($data['jsUrls']) . " scripts.\n";
-
 $warnings = [];
-if ($data['truncated']) {
+if (!Cfg::$crawl) {
+    // nothing to warn about from a crawl
+} elseif ($data['truncated']) {
     $warnings[] = 'The crawl stopped at the --max-pages limit (' . Cfg::$maxPages . ') before every page was visited. '
         . 'Classes used only on pages that were not visited are wrongly listed as unused. Raise --max-pages or use --exclude.';
 }
@@ -1224,19 +1414,58 @@ if ($data['failed'] > 0) {
     $warnings[] = $data['failed'] . ' page(s) could not be read (errors, timeouts or blocked requests). '
         . 'Classes used only on those pages may be wrongly listed as unused.';
 }
-if ($data['parsed'] <= 1) {
+if (Cfg::$crawl && $data['parsed'] <= 1) {
     $warnings[] = 'Only one page was found. If the site builds its pages with JavaScript (React, Vue, etc.) '
         . 'or hides its links behind JavaScript, this tool cannot see them - results are unreliable.';
 }
-if (!$data['cssUrls'] && !$data['inlineCss']) {
+if (Cfg::$crawl && !$data['cssUrls'] && !$data['inlineCss']) {
     $warnings[] = 'No stylesheets were found on the site.';
+}
+
+// Read the source files, if asked: every word in them counts as "used".
+$tokens = $data['tokens'];
+$sourceFiles = 0;
+$localCss = [];
+$unlinkedCss = [];
+if (Cfg::$sourceDirs) {
+    echo 'Reading source files in ' . implode(', ', Cfg::$sourceDirs) . " ...\n";
+    $scan = scanSources($tokens);
+    $sourceFiles = $scan['files'];
+    $localCss = $scan['css'];
+    $foundCss = count($localCss);
+    echo "Source files read: $sourceFiles" . (Cfg::$localCss ? ", stylesheets found: $foundCss" : '') . "\n";
+    if ($localCss && !Cfg::$includeUnlinkedCss) {
+        if (!$scan['refs']) {
+            $warnings[] = 'No source file mentions a .css file, so every stylesheet in the folder is being checked. '
+                . 'If some of them are not used by the website, the results will be misleading.';
+        } else {
+            foreach ($localCss as $real => $info) {
+                if (!cssIsLinked($info['rel'], $scan['refs'])) {
+                    $unlinkedCss[$real] = $info['label'];
+                    unset($localCss[$real]);
+                }
+            }
+            echo 'Stylesheets referenced by your source files: ' . count($localCss) . ' of ' . $foundCss . "\n";
+        }
+    }
+    if ($sourceFiles === 0) {
+        $warnings[] = 'No source files were found in the --source folder(s) with the file types ('
+            . implode(', ', Cfg::$sourceExts) . '). Nothing was added to the list of names in use, '
+            . 'so the results are unreliable. Check the folder and --source-ext.';
+    }
+    if ($scan['skipped'] > 0) {
+        $warnings[] = $scan['skipped'] . ' source file(s) were skipped because they were unreadable, binary or over 20 MB.';
+    }
+    if (!Cfg::$crawl && !$foundCss) {
+        $warnings[] = 'No .css files were found in the --source folder(s), so there was nothing to check. '
+            . 'Add the website address to check the live stylesheets instead.';
+    }
 }
 foreach ($warnings as $w) {
     echo "WARNING: $w\n";
 }
 
 // Harvest words from internal JS files: they often add classes at runtime.
-$tokens = $data['tokens'];
 if ($data['jsUrls']) {
     echo 'Reading ' . count($data['jsUrls']) . " script(s) for class names...\n";
 }
@@ -1261,12 +1490,19 @@ foreach ($data['inlineCss'] as $h => $item) {
     $pending[] = ['name' => 'inline <style> on ' . $item['page'], 'url' => null, 'css' => $item['css'],
                   'base' => $item['page'], 'file' => 'inline-' . substr((string) $h, 0, 8) . '.css'];
 }
+foreach ($localCss as $real => $info) {
+    $label = is_array($info) ? $info['label'] : $info;
+    $pending[] = ['name' => $label, 'url' => null, 'css' => null, 'path' => $real, 'base' => $real,
+                  'file' => trim((string) preg_replace('/[^A-Za-z0-9._-]+/', '_', $label), '_')];
+}
 
 $report = [
     'tool'          => 'unused_css.php ' . VERSION,
-    'site'          => Cfg::$scheme . '://' . Cfg::$host . Cfg::$port . '/',
+    'site'          => Cfg::$crawl ? Cfg::$scheme . '://' . Cfg::$host . Cfg::$port . '/' : implode(', ', Cfg::$sourceDirs),
     'date'          => date('c'),
     'pagesRead'     => $data['parsed'],
+    'sourceFiles'   => $sourceFiles,
+    'sourceDirs'    => Cfg::$sourceDirs,
     'warnings'      => [],
     'files'         => [],
     'unusedClasses' => [],
@@ -1294,11 +1530,23 @@ for ($idx = 0; $idx < count($pending); $idx++) {
         $path = (string) parse_url($src['url'], PHP_URL_PATH);
         $name = preg_replace('/[^A-Za-z0-9._-]+/', '_', ltrim($path, '/'));
         $src['file'] = $name !== '' ? $name : 'style';
-        if (!preg_match('/\.css$/i', $src['file'])) {
-            $src['file'] .= '.css';
+    } elseif (isset($src['path'])) {
+        $k = 'file:' . $src['path'];
+        if (isset($visited[$k])) {
+            continue;
+        }
+        $visited[$k] = true;
+        $css = @file_get_contents($src['path']);
+        if ($css === false) {
+            $warnings[] = "Could not read stylesheet: {$src['path']}";
+            fwrite(STDERR, "Could not read stylesheet: {$src['path']}\n");
+            continue;
         }
     } else {
         $css = $src['css'];
+    }
+    if (!preg_match('/\.css$/i', (string) $src['file'])) {
+        $src['file'] .= '.css';
     }
 
     // never let two stylesheets overwrite each other in purged/
@@ -1311,6 +1559,26 @@ for ($idx = 0; $idx < count($pending); $idx++) {
     $nodes = parseCss($css);
 
     foreach (importsIn($nodes) as $imp) {
+        if (isset($src['path'])) {
+            // @import inside a stylesheet read from disk: follow relative paths, skip web addresses
+            if (preg_match('#^([a-z][a-z0-9+.\-]*:|//)#i', $imp)) {
+                continue;
+            }
+            $clean = (string) preg_replace('/[?#].*$/', '', $imp);
+            $tries = $clean !== '' && $clean[0] === '/' ? array_map(function ($d) use ($clean) {
+                return $d . $clean;
+            }, Cfg::$sourceDirs) : [dirname($src['path']) . '/' . $clean];
+            foreach ($tries as $t) {
+                $real = realpath($t);
+                if ($real !== false && is_file($real)) {
+                    $pending[] = ['name' => $src['name'] . ' > ' . basename($real), 'url' => null, 'css' => null,
+                                  'path' => $real, 'base' => $real,
+                                  'file' => trim((string) preg_replace('/[^A-Za-z0-9._-]+/', '_', basename($real)), '_')];
+                    break;
+                }
+            }
+            continue;
+        }
         $abs = resolveUrl($imp, $src['base']);
         if ($abs && (Cfg::$externalCss || isInternal($abs))) {
             $pending[] = ['name' => $abs, 'url' => $abs, 'css' => null, 'base' => $abs, 'file' => null];
@@ -1346,7 +1614,25 @@ for ($idx = 0; $idx < count($pending); $idx++) {
     }
 }
 
+// Stylesheets nothing refers to (and that no other stylesheet imports) were left out.
+$notChecked = [];
+foreach ($unlinkedCss as $real => $label) {
+    if (!isset($visited['file:' . $real])) {
+        $notChecked[] = $label;
+    }
+}
+if ($notChecked) {
+    $shown = array_slice($notChecked, 0, 10);
+    $w = count($notChecked) . ' stylesheet(s) in the source folder are not referenced by any source file and were not checked: '
+        . implode(', ', $shown) . (count($notChecked) > 10 ? ', and ' . (count($notChecked) - 10) . ' more' : '')
+        . '. They may be unused, or loaded in a way that is not visible in the source. '
+        . 'Add --include-unlinked-css to check them too.';
+    $warnings[] = $w;
+    echo "WARNING: $w\n";
+}
+
 $report['warnings']      = $warnings;
+$report['unlinkedCss']   = $notChecked;
 $report['failedPages']   = $data['failures'];
 $report['unusedClasses'] = array_map('strval', array_keys($allClasses));
 $report['unusedIds']     = array_map('strval', array_keys($allIds));
@@ -1357,7 +1643,13 @@ file_put_contents(Cfg::$outputDir . '/report.json', json_encode($report, JSON_PR
 
 $txt  = "Unused CSS report for {$report['site']}\n" . str_repeat('=', 60) . "\n";
 $txt .= "Generated {$report['date']} by {$report['tool']}\n";
-$txt .= "Pages read: {$report['pagesRead']}\n\n";
+if (Cfg::$crawl) {
+    $txt .= "Pages read: {$report['pagesRead']}\n";
+}
+if (Cfg::$sourceDirs) {
+    $txt .= "Source files read: {$report['sourceFiles']}\n";
+}
+$txt .= "\n";
 if ($warnings) {
     $txt .= "WARNINGS\n";
     foreach ($warnings as $w) {

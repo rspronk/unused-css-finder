@@ -2,6 +2,7 @@
 
 A command-line PHP script that crawls your whole website and reports the CSS classes and ids that no page uses. Think PurgeCSS, but it finds the pages for you.
 
+- **Can read your source files too.** Point it at your website's folder and it covers logins and members areas a crawler cannot reach.
 - **One file.** `unused_css.php`, no Composer, no dependencies.
 - **Reads, never writes.** It only fetches pages. Your site and your CSS files are not changed.
 - **Polite.** Follows `robots.txt` and `Crawl-delay`, with adjustable speed.
@@ -38,6 +39,27 @@ When it finishes, look in the `unused-css-example.com` folder it created next to
 | `report.json` | The same data for other tools, including every selector that would be removed |
 | `purged/*.css` | Only with `--purge`. Cleaned copies of each stylesheet. Your originals are never touched |
 
+### Checking source files (logins, members areas)
+
+A crawler cannot log in. If you have the website's files, add `--source`:
+
+```bash
+# Source files only: reads your templates and scripts, checks the .css files they refer to
+php unused_css.php --source=/var/www/example
+
+# Crawl the live site AND read the source files (the most complete check)
+php unused_css.php https://example.com/ --source=/var/www/example
+
+# Only some file types, skip tests and minified scripts
+php unused_css.php --source=/var/www/example --source-ext=php,html,js --source-exclude=/tests/ --source-exclude=.min.js
+```
+
+On Windows write the folder as `--source="C:\wamp64\www\example"`.
+
+How it works: every word in each source file counts as "in use", so `class="members-only"`, `classList.add('is-open')` and `echo 'btn-' . $type` all keep their classes. It reads html, htm, php, phtml, twig, js, jsx, ts, tsx, vue, svelte and more (change with `--source-ext`), and skips `node_modules`, `vendor`, `.git` and similar folders. Because every word counts, it errs on the side of keeping CSS: a class called `header` is kept if the word "header" appears anywhere, even in a comment. Expect fewer unused classes than a crawl finds, and use `--source-exclude` for third-party or minified files.
+
+Only stylesheets that a source file refers to (a `<link>`, an `@import`, a script or `wp_enqueue_style` call) are checked, so spare or old `.css` files are not. The report lists the ones that were left out (`unlinkedCss` in `report.json`). Add `--include-unlinked-css` to check them anyway.
+
 ### Common examples
 
 ```bash
@@ -60,7 +82,7 @@ If a crawl is interrupted, run the same command again to resume. Add `--fresh` t
 
 | Option | Default | What it does |
 | --- | --- | --- |
-| `<url>` | required | The page to start from, usually your home page |
+| `<url>` | required, unless `--source` is used | The page to start from, usually your home page |
 | `--output=DIR` | `./unused-css-<host>` | Folder for the reports and saved progress |
 | `--purge` | off | Also write cleaned copies of every stylesheet to `DIR/purged/` |
 | `--max-pages=N` | 5000 | Stop after N pages; `0` means no limit |
@@ -78,6 +100,12 @@ If a crawl is interrupted, run the same command again to resume. Add `--fresh` t
 | `--no-robots` | off | Ignore robots.txt (only on a site you own) |
 | `--insecure` | off | Skip SSL certificate checks |
 | `--user-agent=TEXT` | `UnusedCssFinder/1.0` | The name the crawler sends |
+| `--source=DIR` | none | Read the source files in this folder for class and id names (repeatable). With no web address, the `.css` files in the folder that your source files refer to are checked too |
+| `--source-ext=LIST` | `html,htm,php,js,vue` and more | File types to read, comma separated. Replaces the default list |
+| `--source-exclude=PATTERN` | none | Skip source paths that match, measured from the source folder (`/tests/`, `.min.js`) (repeatable) |
+| `--no-default-source-excludes` | off | Also read `node_modules`, `vendor`, `.git` and similar folders |
+| `--local-css` | off | With a web address, also check the `.css` files found in the source folders |
+| `--include-unlinked-css` | off | Check every `.css` file in the source folders, not just the ones a source file refers to |
 | `--fresh` | off | Ignore saved progress and start again |
 | `--config=FILE` | none | Read options from a JSON file (the command line wins) |
 | `--help`, `--version` | | Show help or the version |
@@ -99,6 +127,8 @@ If a crawl is interrupted, run the same command again to resume. Add `--fresh` t
   "exclude": ["/blog/", "/forum/*"],
   "safelist": ["btn-*", "modal", "re:^col-(sm|md|lg)-\\d+$"],
   "safelist-id": ["cookie-banner"],
+  "source": ["/var/www/example"],
+  "source-exclude": ["/tests/", ".min.js"],
   "purge": true
 }
 ```
@@ -110,7 +140,7 @@ Run it with `php unused_css.php --config=unused-css.json`.
 This is a careful estimate, not proof. Always review the report before deleting any CSS.
 
 - **JavaScript is not run.** Content built in the browser (React, Vue, AJAX, infinite scroll) is invisible to it.
-- **Only linked pages are found.** It does not log in, submit forms or read your sitemap.
+- **Only linked pages are found by a crawl.** It does not log in, submit forms or read your sitemap. Use `--source` to cover those areas.
 - **States that are not showing** (error messages, banners, A/B variants) may be missed. Safelist them.
 - **Selectors are not matched against page structure.** `.menu .item` is kept if both classes appear anywhere on the site.
 - **Only classes and ids are examined.** Tag and attribute selectors, `:not()`/`:is()`/`:where()`/`:has()` arguments and native CSS nesting are not analysed.
