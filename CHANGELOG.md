@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.1.2
+- Fixed the "curl_close() is deprecated" notice on PHP 8.5. The script no longer calls it on PHP 8.0 and newer, where it did nothing.
+
 ## 1.1.1
 - With `--source`, only the `.css` files that a source file refers to (a `<link>`, `@import`, script or enqueue call) are checked. Spare or old stylesheets are left out and listed in the report (`unlinkedCss`). New `--include-unlinked-css` option to check every `.css` file.
 
