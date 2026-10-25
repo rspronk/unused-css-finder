@@ -25,7 +25,7 @@ if (PHP_SAPI !== 'cli') {
  * Run with --help for every option.
  */
 
-const VERSION = '1.1.1';
+const VERSION = '1.1.2';
 
 // Classes that are normally added by JavaScript at runtime and so are always kept.
 // Disable with --no-default-safelist.
@@ -521,6 +521,17 @@ function baseCurlOptions(): array
     ];
 }
 
+/**
+ * Releases a curl handle. From PHP 8.0 handles are objects that free themselves, and curl_close()
+ * is deprecated in PHP 8.5, so it is only called on older versions.
+ */
+function closeCurl($ch): void
+{
+    if (PHP_VERSION_ID < 80000) {
+        curl_close($ch);
+    }
+}
+
 /** Blocking GET used for stylesheets / scripts / robots.txt. Returns null on failure. */
 function fetchText(string $url): ?string
 {
@@ -528,7 +539,7 @@ function fetchText(string $url): ?string
     curl_setopt_array($ch, baseCurlOptions() + [CURLOPT_MAXFILESIZE => 20 * 1024 * 1024]);
     $body = curl_exec($ch);
     $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
-    curl_close($ch);
+    closeCurl($ch);
     return (is_string($body) && $code === 200) ? $body : null;
 }
 
@@ -542,7 +553,7 @@ function resolveStartUrl(): void
     $err   = curl_error($ch);
     $code  = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
     $eff   = (string) curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);
-    curl_close($ch);
+    closeCurl($ch);
 
     if ($errno !== 0) {
         $hint = in_array($errno, [35, 51, 58, 59, 60, 77, 83], true)
@@ -845,7 +856,7 @@ final class Crawler
                     $this->recordFailure($req, curl_strerror($info['result']));
                 }
                 curl_multi_remove_handle($mh, $ch);
-                curl_close($ch);
+                closeCurl($ch);
 
                 $this->done++;
                 if ($this->done % 50 === 0) {
