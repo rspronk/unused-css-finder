@@ -10,7 +10,7 @@ A command-line PHP script that crawls your whole website and reports the CSS cla
 
 **Documentation, options and troubleshooting:** https://www.cssportal.com/unused-css-finder/unused-css-finder-cli.php
 
-It also has an online report viewer there: drop the `report.json` file onto the page for an easy-to-read, searchable summary. The file is read in your browser and never uploaded.
+**Report viewer:** drop the `report.json` file onto the [online report viewer](https://www.cssportal.com/unused-css-finder/unused-css-report-viewer.php) for an easy-to-read, searchable summary. You can hide stylesheets that have nothing to remove. The file is read in your browser and never uploaded.
 
 ## Requirements
 
